@@ -25,7 +25,8 @@ from . import (
     result,
     usage as _usage,
 )
-from ._agent_graph import EndStrategy, capture_run_messages  # imported for re-export
+from ._agent_graph import EndStrategy, _build_streamed_run_result, capture_run_messages  # imported for re-export
+from .models import QueueingStreamedResponse
 from .result import ResultDataT
 from .settings import ModelSettings, merge_model_settings
 from .tools import (
@@ -574,36 +575,59 @@ class Agent(Generic[AgentDepsT, ResultDataT]):
                 run_span=run_span,
             )
 
+            ### changes start here.  set up a streaming response object and wrap it in a
+            ### streamed run result object which can be yielded immediately while the
+            ### agent graph runs in the background.  the streaming response object will
+            ### be attached to all graph nodes and used to stream out the content part of
+            ### responses as they come in.
+
+            streaming_response = QueueingStreamedResponse()
+            streamed_run_result = _build_streamed_run_result(
+                streaming_response, None, GraphRunContext(graph_state, graph_deps)
+            )
+
             start_node = _agent_graph.StreamUserPromptNode[AgentDepsT](
                 user_prompt=user_prompt,
                 system_prompts=self._system_prompts,
                 system_prompt_functions=self._system_prompt_functions,
                 system_prompt_dynamic_functions=self._system_prompt_dynamic_functions,
+                streaming_response=streaming_response,
             )
 
             # Actually run
-            node = start_node
-            history: list[HistoryStep[_agent_graph.GraphAgentState, RunResultDataT]] = []
-            while True:
-                if isinstance(node, _agent_graph.StreamModelRequestNode):
-                    node = cast(
-                        _agent_graph.StreamModelRequestNode[
-                            AgentDepsT, result.StreamedRunResult[AgentDepsT, RunResultDataT]
-                        ],
-                        node,
-                    )
-                    async with node.run_to_result(GraphRunContext(graph_state, graph_deps)) as r:
-                        if isinstance(r, End):
-                            yield r.data
-                            break
-                assert not isinstance(node, End)  # the previous line should be hit first
-                node = await graph.next(
-                    node,
-                    history,
-                    state=graph_state,
-                    deps=graph_deps,
-                    infer_name=False,
-                )
+            async def run() -> None:
+                try:
+                    node = start_node
+                    history: list[HistoryStep[_agent_graph.GraphAgentState, RunResultDataT]] = []
+                    while True:
+                        if isinstance(node, _agent_graph.StreamModelRequestNode):
+                            node = cast(
+                                _agent_graph.StreamModelRequestNode[
+                                    AgentDepsT,
+                                    result.StreamedRunResult[AgentDepsT, RunResultDataT],
+                                ],
+                                node,
+                            )
+                            run_context = GraphRunContext(graph_state, graph_deps)
+                            async with node.run_to_result(run_context) as r:
+                                if isinstance(r, End):
+                                    streamed_run_result.messages = run_context.state.message_history
+                                    break
+
+                        assert not isinstance(node, End)  # the previous line should be hit first
+                        node = await graph.next(
+                            node,
+                            history,
+                            state=graph_state,
+                            deps=graph_deps,
+                            infer_name=False,
+                        )
+                finally:
+                    await streaming_response.done()
+
+            task = asyncio.create_task(run())
+            yield streamed_run_result
+            await task
 
     @contextmanager
     def override(

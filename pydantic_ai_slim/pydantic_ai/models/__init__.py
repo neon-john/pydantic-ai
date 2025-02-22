@@ -6,6 +6,7 @@ specific LLM being used.
 
 from __future__ import annotations as _annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -255,6 +256,44 @@ class StreamedResponse(ABC):
     def timestamp(self) -> datetime:
         """Get the timestamp of the response."""
         raise NotImplementedError()
+
+
+class EndOfStream:
+    """Sentinel object to signal the end of the stream."""
+
+    pass
+
+
+@dataclass
+class QueueingStreamedResponse(StreamedResponse):
+    """A version of StreamedResponse can receive and yield text asynchronously across multiple agent runs."""
+
+    _model_name = 'queueing_streamed_response'
+
+    def __init__(self) -> None:
+        super().__init__(self._model_name)
+        self._queue: asyncio.Queue[ModelResponseStreamEvent | EndOfStream] = asyncio.Queue()
+
+    async def add_partial(self, partial: StreamedResponse) -> None:
+        async for event in partial:
+            self._queue.put_nowait(event)
+
+    async def done(self) -> None:
+        await self._queue.put(EndOfStream())
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, EndOfStream):
+                break
+            yield item
+
+    def get(self) -> ModelResponse:
+        """No parts are returned this way. Only through the async iterator."""
+        return ModelResponse(parts=[])
+
+    def timestamp(self) -> datetime.datetime:
+        return datetime.datetime.now()
 
 
 ALLOW_MODEL_REQUESTS = True
